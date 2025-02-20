@@ -5,6 +5,7 @@ use std::{
 
 use circuit::Circuit;
 use clap::Parser;
+use arith::Field;
 use config::{Config, GKRConfig, GKRScheme};
 use config_macros::declare_gkr_config;
 use gf2::GF2x128;
@@ -21,7 +22,7 @@ use gkr::{
         KECCAK_BN254_CIRCUIT, KECCAK_BN254_WITNESS, KECCAK_GF2_CIRCUIT, KECCAK_GF2_WITNESS,
         KECCAK_M31_CIRCUIT, KECCAK_M31_WITNESS, POSEIDON_M31_CIRCUIT, POSEIDON_M31_WITNESS,
     },
-    Prover,
+    Prover, Verifier,
 };
 
 #[allow(unused_imports)]
@@ -181,7 +182,7 @@ fn run_benchmark<Cfg: GKRConfig>(args: &Args, config: Config<Cfg>) {
     println!("Circuit loaded!");
 
     let mut rng = ChaCha12Rng::seed_from_u64(PCS_TESTING_SEED_U64);
-    let (pcs_params, pcs_proving_key, _pcs_verification_key, pcs_scratch) =
+    let (pcs_params, pcs_proving_key, pcs_verification_key, pcs_scratch) =
         expander_pcs_init_testing_only::<Cfg::FieldConfig, Cfg::Transcript, Cfg::PCS>(
             circuit_template.log_input_size(),
             &config.mpi_config,
@@ -197,13 +198,49 @@ fn run_benchmark<Cfg: GKRConfig>(args: &Args, config: Config<Cfg>) {
             let local_config = config.clone();
             let pcs_params = pcs_params.clone();
             let pcs_proving_key = pcs_proving_key.clone();
+            let pcs_verification_key = pcs_verification_key.clone();
             let mut pcs_scratch = pcs_scratch.clone();
             thread::spawn(move || {
                 // bench func
                 let mut prover = Prover::new(&local_config);
                 prover.prepare_mem(&c);
                 loop {
-                    prover.prove(&mut c, &pcs_params, &pcs_proving_key, &mut pcs_scratch);
+                    let start_time: std::time::Instant = std::time::Instant::now();
+                    let (claimed_v, proof) = prover.prove(&mut c, &pcs_params, &pcs_proving_key, &mut pcs_scratch);
+
+                    println!("proved in {}ms", start_time.elapsed().as_millis());
+                    {
+                        println!("Proof size: {} bytes", proof.bytes.len());
+                    }
+                    let mut public_input_gathered = if local_config.mpi_config.is_root() {
+                        vec![
+                            <Cfg::FieldConfig as GKRFieldConfig>::SimdCircuitField::ZERO;
+                            c.public_input.len() * local_config.mpi_config.world_size()
+                        ]
+                    } else {
+                        vec![]
+                    };
+                    local_config
+                        .mpi_config
+                        .gather_vec(&c.public_input, &mut public_input_gathered);
+                
+                    let verifier = Verifier::new(&local_config);
+                    println!("Verifier created.");
+                    
+                    let verification_start = std::time::Instant::now();
+                    assert!(verifier.verify(
+                        &mut c,
+                        &public_input_gathered,
+                        &claimed_v,
+                        &pcs_params,
+                        &pcs_verification_key,
+                        &proof
+                    ));
+                    println!(
+                        "Verification time: {} μs",
+                        verification_start.elapsed().as_micros()
+                    );
+                    println!("verified in {}ms", start_time.elapsed().as_millis());
                     // update cnt
                     let mut cnt = partial_proof_cnt.lock().unwrap();
                     let proof_cnt_this_round = circuit_copy_size * pack_size;
